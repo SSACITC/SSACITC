@@ -4,39 +4,60 @@ service cloud.firestore {
 
     // ---------- helpers ----------
     function signedIn() { return request.auth != null; }
+    function hasEmail() { return signedIn() && request.auth.token.email != null; }
     function email() { return request.auth.token.email.lower(); }
-    function isAdmin() { return signedIn() && request.auth.token.email != null && email() == 'vlogselectroshial@gmail.com'; }
-    function isPanelist() {
-      return isAdmin() || (signedIn() && request.auth.token.email != null
-        && exists(/databases/$(database)/documents/staff/$(email())));
+    function verified() { return request.auth.token.email_verified == true; }
+    function isAdmin() { return hasEmail() && verified() && email() == 'vlogselectroshial@gmail.com'; }
+    function staffPath() { return /databases/$(database)/documents/staff/$(email()); }
+    function isStaff() { return hasEmail() && verified() && exists(staffPath()); }
+    function isPanelist() { return isAdmin() || isStaff(); }
+    // what a panelist may do is stored in their staff document (perms list), set only by the admin
+    function can(p) {
+      return isAdmin() || (isStaff() && (('all' in get(staffPath()).data.get('perms', [])) || (p in get(staffPath()).data.get('perms', []))));
     }
     function isMember() {
       return signedIn()
         && exists(/databases/$(database)/documents/members/$(request.auth.uid))
         && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.status == 'approved';
     }
-    // a student whose ID is in the member list (and mobile or roll matches) is approved at once
     function rosterMatch(d) {
       let r = /databases/$(database)/documents/roster/$(d.sid);
       return exists(r) && (get(r).data.phone10 == d.phone10 || get(r).data.roll == d.roll);
     }
+    function isId(v) { return v is string && v.matches('^[0-9]{10}$'); }
 
     // ---------- public pages ----------
     match /committee/{cid} {
       allow read: if true;
       allow create, delete: if isAdmin();
-      allow update: if isAdmin() || (isPanelist()
-        && get(/databases/$(database)/documents/staff/$(email())).data.cid == cid
+      allow update: if isAdmin() || (isStaff()
+        && get(staffPath()).data.cid == cid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photo', 'bio', 'phone', 'fb', 'skills', 'pop']));
     }
-    match /gallery/{id} {
+    match /gallery/{id} { allow read: if true; allow write: if can('gallery'); }
+    match /videos/{id} { allow read: if true; allow write: if can('videos'); }
+    match /projects/{id} { allow read: if true; allow write: if can('projects'); }
+    match /settings/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /rank/{id} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow write: if can('ranking') || can('attendance') || can('progress');
     }
 
-    // ---------- panelists (which email is which panelist) ----------
+    // ---------- contact page questions ----------
+    match /questions/{id} {
+      allow read: if resource.data.answered == true || can('qa');
+      allow create: if request.resource.data.keys().hasOnly(['name', 'text', 'answered', 'at'])
+        && request.resource.data.answered == false
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 60
+        && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 500
+        && request.resource.data.at is number;
+      allow update: if can('qa') && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['answer', 'answered', 'answeredBy', 'answeredAt']);
+      allow delete: if can('qa');
+    }
+
+    // ---------- panelists (which email is which panelist, and what they can do) ----------
     match /staff/{k} {
-      allow read: if isAdmin() || (signedIn() && request.auth.token.email != null && email() == k);
+      allow read: if isAdmin() || (hasEmail() && email() == k);
       allow write: if isAdmin();
     }
 
@@ -45,42 +66,58 @@ service cloud.firestore {
       allow read: if signedIn() && (request.auth.uid == uid || isPanelist());
       allow create: if signedIn() && request.auth.uid == uid
         && request.resource.data.id == uid
+        && isId(request.resource.data.sid)
+        && request.resource.data.keys().hasOnly(['id', 'sid', 'name', 'roll', 'cls', 'phone', 'phone10', 'email', 'why', 'dept', 'learn', 'prog', 'at', 'status', 'mid', 'how', 'decidedAt', 'decidedBy'])
+        && request.resource.data.name.size() <= 80 && request.resource.data.why.size() <= 1000
         && (request.resource.data.status == 'pending'
           || (request.resource.data.status == 'approved' && rosterMatch(request.resource.data)))
         && (!exists(/databases/$(database)/documents/settings/reg) || get(/databases/$(database)/documents/settings/reg).data.open != false);
-      allow update: if signedIn() && (isPanelist()
-        || (request.auth.uid == uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photo', 'prog'])));
-      allow delete: if isPanelist();
+      allow update: if isAdmin()
+        || (can('members') && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'mid', 'how', 'decidedAt', 'decidedBy']))
+        || (signedIn() && request.auth.uid == uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photo', 'prog']));
+      allow delete: if can('members');
     }
     match /roster/{id} {
-      allow read, write: if isPanelist();
+      allow read: if can('members');
+      allow create, update: if can('members') && isId(request.resource.data.id);
+      allow delete: if can('members');
     }
 
     // ---------- posts, notices, notifications ----------
     match /notices/{id} {
       allow read: if isPanelist() || isMember();
-      allow create, delete: if isPanelist();
-      allow update: if isPanelist() || (isMember()
+      allow create, delete: if can('notice');
+      allow update: if can('notice') || (isMember()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'comments', 'shares']));
     }
     match /formal/{id} {
       allow read: if isPanelist() || isMember();
-      allow write: if isPanelist();
+      allow write: if can('notice');
     }
     match /notifs/{id} {
-      allow create: if signedIn();
+      allow create: if isPanelist() || (signedIn()
+        && request.resource.data.to == 'p'
+        && request.resource.data.keys().hasOnly(['id', 'to', 'type', 'text', 'at', 'read'])
+        && request.resource.data.type in ['apply', 'joined', 'comment']
+        && request.resource.data.text.size() <= 300);
       allow read: if signedIn() && ((resource.data.to == 'p' && isPanelist()) || resource.data.to == request.auth.uid);
       allow update: if isPanelist() || (signedIn() && resource.data.to == request.auth.uid);
       allow delete: if isPanelist();
     }
 
-    // ---------- settings, ranking, records, department updates ----------
-    match /settings/{id} { allow read: if true; allow write: if isAdmin(); }
-    match /rank/{id} { allow read: if true; allow write: if isPanelist(); }
+    // ---------- records (attendance, fees, tests, tasks, courses) and department updates ----------
     match /records/{id} {
+      function kindOk(k) { return k == 'attendance' ? can('attendance') : (k == 'fee' ? can('fee') : can('progress')); }
       allow read: if isPanelist() || (signedIn() && resource.data.sid == request.auth.uid);
-      allow write: if isPanelist();
+      allow create, update: if isPanelist() && kindOk(request.resource.data.kind);
+      allow delete: if isPanelist() && kindOk(resource.data.kind);
     }
-    match /dposts/{id} { allow read: if isPanelist() || isMember(); allow write: if isPanelist(); }
+    match /dposts/{id} {
+      allow read: if isPanelist() || isMember();
+      allow write: if can('notice') || can('progress');
+    }
+
+    // everything else is closed
+    match /{document=**} { allow read, write: if false; }
   }
 }
